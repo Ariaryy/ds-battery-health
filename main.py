@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import joblib
 import pandas as pd
@@ -15,12 +15,50 @@ from xgboost import XGBRegressor
 
 ROOT = Path(__file__).resolve().parent
 DATASET_PATH = ROOT / "datasets" / "user_behavior_dataset.csv"
-ARTIFACT_PATH = ROOT / "battery_predictor_v2.pkl"
+ARTIFACT_PATH = ROOT / "battery_predictor_v3.pkl"
+
+BUNDLE_VERSION = 3
+DEFAULT_BATTERY_CAPACITY_MAH = 4600.0
+MIN_USAGE_SHARE = 0.05
 
 TARGET_COLUMN = "Battery Drain (mAh/day)"
 STATIC_COLUMNS = ["Device Model", "Operating System", "Number of Apps Installed"]
 DYNAMIC_COLUMNS = ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)"]
 FEATURE_COLUMNS = STATIC_COLUMNS + DYNAMIC_COLUMNS
+USAGE_CURVE = [
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.04,
+    0.04,
+    0.04,
+    0.055,
+    0.055,
+    0.055,
+    0.055,
+    0.055,
+    0.055,
+    0.055,
+    0.055,
+    0.07,
+    0.07,
+    0.07,
+    0.07,
+    0.07,
+    0.015,
+    0.015,
+]
+
+
+@dataclass(frozen=True)
+class DeviceSpec:
+    device_model: str
+    operating_system: str
+    number_of_apps_installed: int
+    battery_capacity_mah: float | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +76,9 @@ class ChargingPolicy:
     preferred_level_pct: float = 50.0
     start_charge_pct: float = 45.0
     stop_charge_pct: float = 55.0
-    charge_rate_pct_per_hour: float = 24.0
+    charge_rate_low_band_pct_per_hour: float = 30.0
+    charge_rate_mid_band_pct_per_hour: float = 18.0
+    charge_rate_high_band_pct_per_hour: float = 7.0
     time_step_hours: float = 0.25
 
 
@@ -60,7 +100,10 @@ class DrainForecast:
     historical_dynamic_usage: dict[str, float]
     projected_dynamic_usage: dict[str, float]
     blended_feature_row: dict[str, Any]
-    current_usage_weight: float
+    today_usage_weight: float
+    battery_capacity_mah: float
+    battery_capacity_source: Literal["provided", "assumed_default"]
+    cumulative_usage_share: float
 
 
 @dataclass(frozen=True)
@@ -74,11 +117,13 @@ class ChargingPlan:
 
 @dataclass
 class PredictorBundle:
+    bundle_version: int
     model: XGBRegressor
     preprocessor: ColumnTransformer
     priors: dict[str, Any]
     dynamic_bounds: dict[str, dict[str, float]]
     metrics: dict[str, float]
+    usage_curve: list[float]
 
 
 def validate_snapshot(snapshot: UsageSnapshot) -> None:
@@ -131,55 +176,91 @@ def train_predictor(
         "test_rows": float(len(X_test)),
     }
 
-    priors = build_usage_priors(df)
-    dynamic_bounds = {
-        "low": df[DYNAMIC_COLUMNS].quantile(0.05).to_dict(),
-        "high": df[DYNAMIC_COLUMNS].quantile(0.95).to_dict(),
-    }
-
     bundle = PredictorBundle(
+        bundle_version=BUNDLE_VERSION,
         model=model,
         preprocessor=preprocessor,
-        priors=priors,
-        dynamic_bounds=dynamic_bounds,
+        priors=build_usage_priors(X_train),
+        dynamic_bounds=build_dynamic_bounds(X_train),
         metrics=metrics,
+        usage_curve=USAGE_CURVE.copy(),
     )
     joblib.dump(bundle, artifact_path)
     return bundle
 
 
-def build_usage_priors(df: pd.DataFrame) -> dict[str, Any]:
+def build_usage_priors(train_df: pd.DataFrame) -> dict[str, Any]:
     priors = {
-        "global": df[DYNAMIC_COLUMNS].median().to_dict(),
-        "by_os": df.groupby("Operating System")[DYNAMIC_COLUMNS].median().to_dict(orient="index"),
+        "global": train_df[DYNAMIC_COLUMNS].median().to_dict(),
+        "by_os": train_df.groupby("Operating System")[DYNAMIC_COLUMNS].median().to_dict(orient="index"),
         "by_device_os": {},
     }
-    for (device_model, operating_system), group in df.groupby(["Device Model", "Operating System"]):
+    for (device_model, operating_system), group in train_df.groupby(["Device Model", "Operating System"]):
         priors["by_device_os"][f"{device_model}|||{operating_system}"] = group[DYNAMIC_COLUMNS].median().to_dict()
     return priors
+
+
+def build_dynamic_bounds(train_df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    return {
+        "low": train_df[DYNAMIC_COLUMNS].quantile(0.05).to_dict(),
+        "high": train_df[DYNAMIC_COLUMNS].quantile(0.95).to_dict(),
+    }
 
 
 def load_predictor(artifact_path: Path = ARTIFACT_PATH, retrain: bool = False) -> PredictorBundle:
     if retrain or not artifact_path.exists():
         return train_predictor(artifact_path=artifact_path)
-    return joblib.load(artifact_path)
+
+    bundle = joblib.load(artifact_path)
+    if getattr(bundle, "bundle_version", None) != BUNDLE_VERSION:
+        return train_predictor(artifact_path=artifact_path)
+    return bundle
 
 
-def lookup_historical_usage(bundle: PredictorBundle, profile: dict[str, Any]) -> dict[str, float]:
-    device_key = f"{profile['Device Model']}|||{profile['Operating System']}"
+def normalize_device_spec(device_spec: DeviceSpec) -> dict[str, Any]:
+    return {
+        "Device Model": device_spec.device_model,
+        "Operating System": device_spec.operating_system,
+        "Number of Apps Installed": device_spec.number_of_apps_installed,
+    }
+
+
+def resolve_battery_capacity(device_spec: DeviceSpec) -> tuple[float, Literal["provided", "assumed_default"]]:
+    if device_spec.battery_capacity_mah is not None:
+        return device_spec.battery_capacity_mah, "provided"
+    return DEFAULT_BATTERY_CAPACITY_MAH, "assumed_default"
+
+
+def lookup_historical_usage(bundle: PredictorBundle, device_spec: DeviceSpec) -> dict[str, float]:
+    device_key = f"{device_spec.device_model}|||{device_spec.operating_system}"
     if device_key in bundle.priors["by_device_os"]:
         return bundle.priors["by_device_os"][device_key]
-    if profile["Operating System"] in bundle.priors["by_os"]:
-        return bundle.priors["by_os"][profile["Operating System"]]
+    if device_spec.operating_system in bundle.priors["by_os"]:
+        return bundle.priors["by_os"][device_spec.operating_system]
     return bundle.priors["global"]
 
 
-def project_usage_to_daily(snapshot: UsageSnapshot, bounds: dict[str, dict[str, float]]) -> dict[str, float]:
-    projection_factor = 24.0 / snapshot.current_hour
+def cumulative_usage_share(current_hour: float, usage_curve: list[float]) -> float:
+    full_hours = int(current_hour)
+    fractional_hour = current_hour - full_hours
+
+    share = sum(usage_curve[:full_hours])
+    if full_hours < len(usage_curve):
+        share += usage_curve[full_hours] * fractional_hour
+
+    return clip(share, MIN_USAGE_SHARE, 1.0)
+
+
+def project_usage_to_daily(
+    snapshot: UsageSnapshot,
+    bounds: dict[str, dict[str, float]],
+    usage_curve: list[float],
+) -> dict[str, float]:
+    usage_share = cumulative_usage_share(snapshot.current_hour, usage_curve)
     projected = {
-        "App Usage Time (min/day)": snapshot.app_usage_minutes_so_far * projection_factor,
-        "Screen On Time (hours/day)": snapshot.screen_on_hours_so_far * projection_factor,
-        "Data Usage (MB/day)": snapshot.data_usage_mb_so_far * projection_factor,
+        "App Usage Time (min/day)": snapshot.app_usage_minutes_so_far / usage_share,
+        "Screen On Time (hours/day)": snapshot.screen_on_hours_so_far / usage_share,
+        "Data Usage (MB/day)": snapshot.data_usage_mb_so_far / usage_share,
     }
     return {
         feature: clip(projected[feature], bounds["low"][feature], bounds["high"][feature])
@@ -191,23 +272,20 @@ def blend_dynamic_usage(
     historical_usage: dict[str, float],
     projected_usage: dict[str, float],
     current_hour: float,
+    usage_curve: list[float],
 ) -> tuple[dict[str, float], float]:
-    current_usage_weight = min(0.85, max(0.2, current_hour / 24.0))
+    today_usage_weight = clip(cumulative_usage_share(current_hour, usage_curve), 0.2, 0.85)
     blended = {}
     for feature in DYNAMIC_COLUMNS:
         blended[feature] = (
-            historical_usage[feature] * (1.0 - current_usage_weight)
-            + projected_usage[feature] * current_usage_weight
+            historical_usage[feature] * (1.0 - today_usage_weight)
+            + projected_usage[feature] * today_usage_weight
         )
-    return blended, current_usage_weight
+    return blended, today_usage_weight
 
 
-def build_feature_row(profile: dict[str, Any], dynamic_usage: dict[str, float]) -> dict[str, Any]:
-    feature_row = {
-        "Device Model": profile["Device Model"],
-        "Operating System": profile["Operating System"],
-        "Number of Apps Installed": profile["Number of Apps Installed"],
-    }
+def build_feature_row(device_spec: DeviceSpec, dynamic_usage: dict[str, float]) -> dict[str, Any]:
+    feature_row = normalize_device_spec(device_spec)
     feature_row.update(dynamic_usage)
     return feature_row
 
@@ -220,27 +298,29 @@ def predict_daily_drain(bundle: PredictorBundle, feature_row: dict[str, Any]) ->
 
 def forecast_drain(
     bundle: PredictorBundle,
-    profile: dict[str, Any],
+    device_spec: DeviceSpec,
     snapshot: UsageSnapshot,
-    battery_capacity_mah: float = 4600.0,
 ) -> DrainForecast:
     validate_snapshot(snapshot)
 
-    historical_usage = lookup_historical_usage(bundle, profile)
-    projected_usage = project_usage_to_daily(snapshot, bundle.dynamic_bounds)
-    blended_usage, current_usage_weight = blend_dynamic_usage(
+    battery_capacity_mah, battery_capacity_source = resolve_battery_capacity(device_spec)
+    historical_usage = lookup_historical_usage(bundle, device_spec)
+    usage_share = cumulative_usage_share(snapshot.current_hour, bundle.usage_curve)
+    projected_usage = project_usage_to_daily(snapshot, bundle.dynamic_bounds, bundle.usage_curve)
+    blended_usage, today_usage_weight = blend_dynamic_usage(
         historical_usage=historical_usage,
         projected_usage=projected_usage,
         current_hour=snapshot.current_hour,
+        usage_curve=bundle.usage_curve,
     )
-    feature_row = build_feature_row(profile, blended_usage)
+    feature_row = build_feature_row(device_spec, blended_usage)
     model_full_day_drain_mah = predict_daily_drain(bundle, feature_row)
 
     observed_drain_so_far_mah = battery_capacity_mah * (
         (snapshot.starting_battery_pct - snapshot.current_battery_pct) / 100.0
     )
-    observed_rate_full_day_drain_mah = observed_drain_so_far_mah * (24.0 / snapshot.current_hour)
-    observed_weight = min(0.8, max(0.15, snapshot.current_hour / 24.0))
+    observed_rate_full_day_drain_mah = observed_drain_so_far_mah / usage_share
+    observed_weight = clip(usage_share, 0.15, 0.8)
     predicted_full_day_drain_mah = (
         model_full_day_drain_mah * (1.0 - observed_weight)
         + observed_rate_full_day_drain_mah * observed_weight
@@ -257,7 +337,10 @@ def forecast_drain(
         historical_dynamic_usage=historical_usage,
         projected_dynamic_usage=projected_usage,
         blended_feature_row=feature_row,
-        current_usage_weight=current_usage_weight,
+        today_usage_weight=today_usage_weight,
+        battery_capacity_mah=battery_capacity_mah,
+        battery_capacity_source=battery_capacity_source,
+        cumulative_usage_share=usage_share,
     )
 
 
@@ -265,15 +348,15 @@ def recommend_charging_plan(
     forecast: DrainForecast,
     snapshot: UsageSnapshot,
     policy: ChargingPolicy = ChargingPolicy(),
-    battery_capacity_mah: float = 4600.0,
 ) -> ChargingPlan:
-    remaining_drain_pct = (forecast.predicted_remaining_drain_mah / battery_capacity_mah) * 100.0
+    remaining_drain_pct = (forecast.predicted_remaining_drain_mah / forecast.battery_capacity_mah) * 100.0
     no_charge_levels, _ = simulate_battery_levels(
         current_battery_pct=snapshot.current_battery_pct,
         current_hour=snapshot.current_hour,
         remaining_drain_pct=remaining_drain_pct,
         snapshot=snapshot,
         historical_usage=forecast.historical_dynamic_usage,
+        usage_curve=USAGE_CURVE,
         policy=policy,
         allow_charging=False,
     )
@@ -283,6 +366,7 @@ def recommend_charging_plan(
         remaining_drain_pct=remaining_drain_pct,
         snapshot=snapshot,
         historical_usage=forecast.historical_dynamic_usage,
+        usage_curve=USAGE_CURVE,
         policy=policy,
         allow_charging=True,
     )
@@ -296,12 +380,21 @@ def recommend_charging_plan(
     )
 
 
+def charge_rate_for_level(level_pct: float, policy: ChargingPolicy) -> float:
+    if level_pct < 50.0:
+        return policy.charge_rate_low_band_pct_per_hour
+    if level_pct < 80.0:
+        return policy.charge_rate_mid_band_pct_per_hour
+    return policy.charge_rate_high_band_pct_per_hour
+
+
 def simulate_battery_levels(
     current_battery_pct: float,
     current_hour: float,
     remaining_drain_pct: float,
     snapshot: UsageSnapshot,
     historical_usage: dict[str, float],
+    usage_curve: list[float],
     policy: ChargingPolicy,
     allow_charging: bool,
 ) -> tuple[list[tuple[float, float]], list[ChargeSession]]:
@@ -330,9 +423,9 @@ def simulate_battery_levels(
             session_start_level = level
 
         if charging:
-            charge_added = policy.charge_rate_pct_per_hour * policy.time_step_hours
+            charge_rate_pct_per_hour = charge_rate_for_level(level, policy)
+            charge_added = charge_rate_pct_per_hour * policy.time_step_hours
             if level + charge_added >= policy.stop_charge_pct:
-                charge_added = policy.stop_charge_pct - level
                 level = policy.stop_charge_pct
                 charging = False
                 sessions.append(
@@ -413,17 +506,22 @@ def format_hour(hour: float) -> str:
 
 def print_report(forecast: DrainForecast, plan: ChargingPlan, policy: ChargingPolicy, metrics: dict[str, float]) -> None:
     print(f"Model MAE: {metrics['mae']:.2f} mAh/day")
+    print(
+        f"Battery capacity used: {forecast.battery_capacity_mah:.1f} mAh "
+        f"({forecast.battery_capacity_source})"
+    )
+    print(f"Expected usage-share observed by now: {forecast.cumulative_usage_share:.2f}")
     print(f"Model-only full-day drain: {forecast.model_full_day_drain_mah:.1f} mAh")
     print(f"Observed-rate full-day drain: {forecast.observed_rate_full_day_drain_mah:.1f} mAh")
     print(f"Predicted full-day drain: {forecast.predicted_full_day_drain_mah:.1f} mAh")
     print(f"Observed drain so far: {forecast.observed_drain_so_far_mah:.1f} mAh")
     print(f"Predicted remaining drain: {forecast.predicted_remaining_drain_mah:.1f} mAh")
-    print(f"Current-usage weight: {forecast.current_usage_weight:.2f}")
+    print(f"Today-usage weight: {forecast.today_usage_weight:.2f}")
     print()
     print("Daily feature blend used for prediction:")
     for feature in DYNAMIC_COLUMNS:
         print(
-            f"  {feature}: historical={forecast.historical_dynamic_usage[feature]:.1f}, "
+            f"  {feature}: typical={forecast.historical_dynamic_usage[feature]:.1f}, "
             f"projected={forecast.projected_dynamic_usage[feature]:.1f}, "
             f"blended={forecast.blended_feature_row[feature]:.1f}"
         )
@@ -436,7 +534,10 @@ def print_report(forecast: DrainForecast, plan: ChargingPlan, policy: ChargingPo
         f"Recommended plan: low={plan.projected_lowest_battery_pct:.1f}%, "
         f"end={plan.projected_end_battery_pct:.1f}%"
     )
-    print(f"Stable band target: {policy.start_charge_pct:.0f}% to {policy.stop_charge_pct:.0f}% around {policy.preferred_level_pct:.0f}%")
+    print(
+        f"Target charging band: {policy.start_charge_pct:.0f}% to "
+        f"{policy.stop_charge_pct:.0f}% around {policy.preferred_level_pct:.0f}%"
+    )
     print()
 
     if not plan.sessions:
@@ -455,11 +556,11 @@ def print_report(forecast: DrainForecast, plan: ChargingPlan, policy: ChargingPo
 def main() -> None:
     bundle = load_predictor()
 
-    profile = {
-        "Device Model": "Xiaomi Mi 11",
-        "Operating System": "Android",
-        "Number of Apps Installed": 85,
-    }
+    device_spec = DeviceSpec(
+        device_model="Xiaomi Mi 11",
+        operating_system="Android",
+        number_of_apps_installed=85,
+    )
     snapshot = UsageSnapshot(
         current_hour=13.0,
         current_battery_pct=38.0,
@@ -470,7 +571,7 @@ def main() -> None:
     )
     policy = ChargingPolicy()
 
-    forecast = forecast_drain(bundle=bundle, profile=profile, snapshot=snapshot)
+    forecast = forecast_drain(bundle=bundle, device_spec=device_spec, snapshot=snapshot)
     plan = recommend_charging_plan(forecast=forecast, snapshot=snapshot, policy=policy)
     print_report(forecast=forecast, plan=plan, policy=policy, metrics=bundle.metrics)
 
