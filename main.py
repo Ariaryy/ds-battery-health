@@ -7,17 +7,26 @@ from typing import Any, Literal
 import joblib
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from xgboost import XGBRegressor
+
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+    XGBOOST_IMPORT_ERROR: str | None = None
+except Exception as error:  # pragma: no cover - depends on local system libraries
+    XGBRegressor = None
+    XGBOOST_AVAILABLE = False
+    XGBOOST_IMPORT_ERROR = str(error)
 
 
 ROOT = Path(__file__).resolve().parent
 DATASET_PATH = ROOT / "datasets" / "user_behavior_dataset.csv"
-ARTIFACT_PATH = ROOT / "battery_predictor_v3.pkl"
+ARTIFACT_PATH = ROOT / "battery_predictor_v4.pkl"
 
-BUNDLE_VERSION = 3
+BUNDLE_VERSION = 4
 DEFAULT_BATTERY_CAPACITY_MAH = 4600.0
 MIN_USAGE_SHARE = 0.05
 
@@ -25,6 +34,16 @@ TARGET_COLUMN = "Battery Drain (mAh/day)"
 STATIC_COLUMNS = ["Device Model", "Operating System", "Number of Apps Installed"]
 DYNAMIC_COLUMNS = ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)"]
 FEATURE_COLUMNS = STATIC_COLUMNS + DYNAMIC_COLUMNS
+NUMERIC_COLUMNS = [
+    "App Usage Time (min/day)",
+    "Screen On Time (hours/day)",
+    "Battery Drain (mAh/day)",
+    "Number of Apps Installed",
+    "Data Usage (MB/day)",
+    "Age",
+    "User Behavior Class",
+]
+CATEGORICAL_COLUMNS = ["Device Model", "Operating System", "Gender"]
 USAGE_CURVE = [
     0.01,
     0.01,
@@ -118,12 +137,59 @@ class ChargingPlan:
 @dataclass
 class PredictorBundle:
     bundle_version: int
-    model: XGBRegressor
+    model: Any
+    model_name: str
     preprocessor: ColumnTransformer
     priors: dict[str, Any]
     dynamic_bounds: dict[str, dict[str, float]]
     metrics: dict[str, float]
     usage_curve: list[float]
+
+
+@dataclass(frozen=True)
+class CleaningReport:
+    original_rows: int
+    cleaned_rows: int
+    removed_duplicate_rows: int
+    rows_removed_for_missing_required_values: int
+    remaining_missing_values: int
+
+
+def load_dataset(dataset_path: Path = DATASET_PATH) -> pd.DataFrame:
+    return pd.read_csv(dataset_path)
+
+
+def clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
+    cleaned = df.copy()
+    original_rows = len(cleaned)
+
+    for column in CATEGORICAL_COLUMNS:
+        cleaned[column] = cleaned[column].astype(str).str.strip()
+
+    for column in NUMERIC_COLUMNS:
+        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
+
+    deduplicated = cleaned.drop_duplicates()
+    removed_duplicate_rows = original_rows - len(deduplicated)
+
+    required_columns = FEATURE_COLUMNS + [TARGET_COLUMN]
+    cleaned = deduplicated.dropna(subset=required_columns)
+    rows_removed_for_missing_required_values = len(deduplicated) - len(cleaned)
+
+    remaining_missing_values = int(cleaned.isna().sum().sum())
+    report = CleaningReport(
+        original_rows=original_rows,
+        cleaned_rows=len(cleaned),
+        removed_duplicate_rows=removed_duplicate_rows,
+        rows_removed_for_missing_required_values=rows_removed_for_missing_required_values,
+        remaining_missing_values=remaining_missing_values,
+    )
+    return cleaned, report
+
+
+def summarize_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    summary = df[NUMERIC_COLUMNS].describe().T
+    return summary[["mean", "std", "min", "25%", "50%", "75%", "max"]].round(2)
 
 
 def validate_snapshot(snapshot: UsageSnapshot) -> None:
@@ -143,7 +209,8 @@ def train_predictor(
     dataset_path: Path = DATASET_PATH,
     artifact_path: Path = ARTIFACT_PATH,
 ) -> PredictorBundle:
-    df = pd.read_csv(dataset_path)
+    raw_df = load_dataset(dataset_path)
+    df, _ = clean_dataset(raw_df)
 
     preprocessor = ColumnTransformer(
         transformers=[
@@ -159,14 +226,7 @@ def train_predictor(
     X_train_processed = preprocessor.fit_transform(X_train)
     X_test_processed = preprocessor.transform(X_test)
 
-    model = XGBRegressor(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-    )
+    model, model_name = build_regressor()
     model.fit(X_train_processed, y_train)
 
     y_pred = model.predict(X_test_processed)
@@ -175,10 +235,15 @@ def train_predictor(
         "train_rows": float(len(X_train)),
         "test_rows": float(len(X_test)),
     }
+    if XGBOOST_IMPORT_ERROR:
+        metrics["xgboost_available"] = 0.0
+    else:
+        metrics["xgboost_available"] = 1.0
 
     bundle = PredictorBundle(
         bundle_version=BUNDLE_VERSION,
         model=model,
+        model_name=model_name,
         preprocessor=preprocessor,
         priors=build_usage_priors(X_train),
         dynamic_bounds=build_dynamic_bounds(X_train),
@@ -187,6 +252,57 @@ def train_predictor(
     )
     joblib.dump(bundle, artifact_path)
     return bundle
+
+
+def get_feature_importance(bundle: PredictorBundle) -> pd.DataFrame:
+    feature_names = bundle.preprocessor.get_feature_names_out()
+    if not hasattr(bundle.model, "feature_importances_"):
+        return pd.DataFrame(
+            {
+                "feature": feature_names,
+                "importance": [0.0] * len(feature_names),
+            }
+        )
+    importance = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance": bundle.model.feature_importances_,
+        }
+    )
+    return importance.sort_values("importance", ascending=False).reset_index(drop=True)
+
+
+def get_cleaning_overview(dataset_path: Path = DATASET_PATH) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
+    raw_df = load_dataset(dataset_path)
+    cleaned_df, report = clean_dataset(raw_df)
+    return raw_df, cleaned_df, report
+
+
+def build_regressor() -> tuple[Any, str]:
+    if XGBOOST_AVAILABLE and XGBRegressor is not None:
+        return (
+            XGBRegressor(
+                n_estimators=300,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=42,
+            ),
+            "XGBoost Regressor",
+        )
+
+    return (
+        RandomForestRegressor(
+            n_estimators=300,
+            max_depth=12,
+            min_samples_split=4,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        ),
+        "Random Forest Regressor",
+    )
 
 
 def build_usage_priors(train_df: pd.DataFrame) -> dict[str, Any]:
