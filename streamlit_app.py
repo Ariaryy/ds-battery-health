@@ -357,6 +357,13 @@ def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) 
 
     device_models = sorted(cleaned_df["Device Model"].dropna().unique().tolist())
     operating_systems = sorted(cleaned_df["Operating System"].dropna().unique().tolist())
+    capacity_lookup = (
+        cleaned_df[["Device Model", main.BATTERY_CAPACITY_COLUMN]]
+        .dropna()
+        .drop_duplicates(subset=["Device Model"])
+        .set_index("Device Model")[main.BATTERY_CAPACITY_COLUMN]
+        .to_dict()
+    )
 
     form_col, summary_col = st.columns([1.1, 1.3])
 
@@ -365,7 +372,14 @@ def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) 
             device_model = st.selectbox("Device Model", device_models, index=min(2, len(device_models) - 1))
             operating_system = st.selectbox("Operating System", operating_systems)
             number_of_apps_installed = st.slider("Number of Apps Installed", 10, 200, 85)
-            battery_capacity_mah = st.number_input("Battery Capacity (mAh)", min_value=1000.0, value=4600.0, step=100.0)
+            suggested_capacity = float(capacity_lookup.get(device_model, main.DEFAULT_BATTERY_CAPACITY_MAH))
+            battery_capacity_mah = st.number_input(
+                "Battery Capacity (mAh)",
+                min_value=1000.0,
+                value=suggested_capacity,
+                step=100.0,
+            )
+            st.caption("Battery capacity is auto-filled from the dataset lookup for the selected device model.")
 
             st.markdown("**Current Usage Snapshot**")
             current_hour = st.slider("Current Hour of Day", min_value=1.0, max_value=24.0, value=13.0, step=0.5)
@@ -452,9 +466,8 @@ def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) 
                 [
                     {
                         "Start Time": main.format_hour(session.start_hour),
-                        "Stop Time": main.format_hour(session.stop_hour),
                         "Start Battery %": session.start_level_pct,
-                        "Stop Battery %": session.stop_level_pct,
+                        "Recommended Stop Battery %": session.recommended_stop_level_pct,
                     }
                     for session in plan.sessions
                 ]

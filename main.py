@@ -23,15 +23,18 @@ except Exception as error:  # pragma: no cover - depends on local system librari
 
 
 ROOT = Path(__file__).resolve().parent
-DATASET_PATH = ROOT / "datasets" / "user_behavior_dataset.csv"
-ARTIFACT_PATH = ROOT / "battery_predictor_v4.pkl"
+RAW_DATASET_PATH = ROOT / "datasets" / "user_behavior_dataset.csv"
+CAPACITY_LOOKUP_PATH = ROOT / "datasets" / "device_battery_capacities.csv"
+DATASET_PATH = ROOT / "datasets" / "user_behavior_dataset_enriched.csv"
+ARTIFACT_PATH = ROOT / "battery_predictor_v5.pkl"
 
-BUNDLE_VERSION = 4
+BUNDLE_VERSION = 5
 DEFAULT_BATTERY_CAPACITY_MAH = 4600.0
 MIN_USAGE_SHARE = 0.05
 
 TARGET_COLUMN = "Battery Drain (mAh/day)"
-STATIC_COLUMNS = ["Device Model", "Operating System", "Number of Apps Installed"]
+BATTERY_CAPACITY_COLUMN = "Battery Capacity (mAh)"
+STATIC_COLUMNS = ["Operating System", "Number of Apps Installed", BATTERY_CAPACITY_COLUMN]
 DYNAMIC_COLUMNS = ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)"]
 FEATURE_COLUMNS = STATIC_COLUMNS + DYNAMIC_COLUMNS
 NUMERIC_COLUMNS = [
@@ -40,6 +43,7 @@ NUMERIC_COLUMNS = [
     "Battery Drain (mAh/day)",
     "Number of Apps Installed",
     "Data Usage (MB/day)",
+    BATTERY_CAPACITY_COLUMN,
     "Age",
     "User Behavior Class",
 ]
@@ -94,7 +98,8 @@ class UsageSnapshot:
 class ChargingPolicy:
     preferred_level_pct: float = 50.0
     start_charge_pct: float = 45.0
-    stop_charge_pct: float = 55.0
+    minimum_stop_charge_pct: float = 55.0
+    maximum_stop_charge_pct: float = 70.0
     charge_rate_low_band_pct_per_hour: float = 30.0
     charge_rate_mid_band_pct_per_hour: float = 18.0
     charge_rate_high_band_pct_per_hour: float = 7.0
@@ -104,9 +109,8 @@ class ChargingPolicy:
 @dataclass(frozen=True)
 class ChargeSession:
     start_hour: float
-    stop_hour: float
     start_level_pct: float
-    stop_level_pct: float
+    recommended_stop_level_pct: float
 
 
 @dataclass(frozen=True)
@@ -121,7 +125,7 @@ class DrainForecast:
     blended_feature_row: dict[str, Any]
     today_usage_weight: float
     battery_capacity_mah: float
-    battery_capacity_source: Literal["provided", "assumed_default"]
+    battery_capacity_source: Literal["provided", "lookup_table", "assumed_default"]
     cumulative_usage_share: float
 
 
@@ -156,12 +160,33 @@ class CleaningReport:
 
 
 def load_dataset(dataset_path: Path = DATASET_PATH) -> pd.DataFrame:
-    return pd.read_csv(dataset_path)
+    if dataset_path.exists():
+        return pd.read_csv(dataset_path)
+
+    raw_df = pd.read_csv(RAW_DATASET_PATH)
+    if CAPACITY_LOOKUP_PATH.exists():
+        capacity_df = pd.read_csv(CAPACITY_LOOKUP_PATH)
+        merged = raw_df.merge(capacity_df[["Device Model", BATTERY_CAPACITY_COLUMN]], on="Device Model", how="left")
+        if BATTERY_CAPACITY_COLUMN in merged.columns:
+            return merged
+    return raw_df
+
+
+def load_capacity_lookup(capacity_lookup_path: Path = CAPACITY_LOOKUP_PATH) -> pd.DataFrame:
+    if not capacity_lookup_path.exists():
+        return pd.DataFrame(columns=["Device Model", BATTERY_CAPACITY_COLUMN])
+    return pd.read_csv(capacity_lookup_path)
 
 
 def clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     cleaned = df.copy()
     original_rows = len(cleaned)
+
+    if BATTERY_CAPACITY_COLUMN not in cleaned.columns:
+        raise ValueError(
+            f"Dataset is missing '{BATTERY_CAPACITY_COLUMN}'. "
+            "Run `uv run python scripts/enrich_battery_capacities.py` first."
+        )
 
     for column in CATEGORICAL_COLUMNS:
         cleaned[column] = cleaned[column].astype(str).str.strip()
@@ -214,8 +239,12 @@ def train_predictor(
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore"), ["Device Model", "Operating System"]),
-            ("num", StandardScaler(), ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)", "Number of Apps Installed"]),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), ["Operating System"]),
+            (
+                "num",
+                StandardScaler(),
+                ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)", "Number of Apps Installed", BATTERY_CAPACITY_COLUMN],
+            ),
         ]
     )
 
@@ -309,10 +338,7 @@ def build_usage_priors(train_df: pd.DataFrame) -> dict[str, Any]:
     priors = {
         "global": train_df[DYNAMIC_COLUMNS].median().to_dict(),
         "by_os": train_df.groupby("Operating System")[DYNAMIC_COLUMNS].median().to_dict(orient="index"),
-        "by_device_os": {},
     }
-    for (device_model, operating_system), group in train_df.groupby(["Device Model", "Operating System"]):
-        priors["by_device_os"][f"{device_model}|||{operating_system}"] = group[DYNAMIC_COLUMNS].median().to_dict()
     return priors
 
 
@@ -335,22 +361,23 @@ def load_predictor(artifact_path: Path = ARTIFACT_PATH, retrain: bool = False) -
 
 def normalize_device_spec(device_spec: DeviceSpec) -> dict[str, Any]:
     return {
-        "Device Model": device_spec.device_model,
         "Operating System": device_spec.operating_system,
         "Number of Apps Installed": device_spec.number_of_apps_installed,
+        BATTERY_CAPACITY_COLUMN: resolve_battery_capacity(device_spec)[0],
     }
 
 
-def resolve_battery_capacity(device_spec: DeviceSpec) -> tuple[float, Literal["provided", "assumed_default"]]:
+def resolve_battery_capacity(device_spec: DeviceSpec) -> tuple[float, Literal["provided", "lookup_table", "assumed_default"]]:
     if device_spec.battery_capacity_mah is not None:
         return device_spec.battery_capacity_mah, "provided"
+    lookup_df = load_capacity_lookup()
+    match = lookup_df.loc[lookup_df["Device Model"] == device_spec.device_model, BATTERY_CAPACITY_COLUMN]
+    if not match.empty:
+        return float(match.iloc[0]), "lookup_table"
     return DEFAULT_BATTERY_CAPACITY_MAH, "assumed_default"
 
 
 def lookup_historical_usage(bundle: PredictorBundle, device_spec: DeviceSpec) -> dict[str, float]:
-    device_key = f"{device_spec.device_model}|||{device_spec.operating_system}"
-    if device_key in bundle.priors["by_device_os"]:
-        return bundle.priors["by_device_os"][device_key]
     if device_spec.operating_system in bundle.priors["by_os"]:
         return bundle.priors["by_os"][device_spec.operating_system]
     return bundle.priors["global"]
@@ -496,6 +523,20 @@ def recommend_charging_plan(
     )
 
 
+def recommended_stop_level_for_session(
+    current_level_pct: float,
+    remaining_drain_pct_from_now: float,
+    policy: ChargingPolicy,
+) -> float:
+    ideal_stop_level_pct = remaining_drain_pct_from_now + policy.preferred_level_pct
+    bounded_stop_level_pct = clip(
+        ideal_stop_level_pct,
+        policy.minimum_stop_charge_pct,
+        policy.maximum_stop_charge_pct,
+    )
+    return max(current_level_pct, bounded_stop_level_pct)
+
+
 def charge_rate_for_level(level_pct: float, policy: ChargingPolicy) -> float:
     if level_pct < 50.0:
         return policy.charge_rate_low_band_pct_per_hour
@@ -528,35 +569,40 @@ def simulate_battery_levels(
     session_start_level = 0.0
     sessions: list[ChargeSession] = []
     levels: list[tuple[float, float]] = [(current_hour, round(level, 2))]
+    target_stop_level_pct = policy.minimum_stop_charge_pct
 
     for step_index, drain_pct in enumerate(drain_per_step):
         step_start_hour = current_hour + (step_index * policy.time_step_hours)
-        step_end_hour = min(24.0, step_start_hour + policy.time_step_hours)
+        remaining_drain_pct_from_now = sum(drain_per_step[step_index:])
 
         if allow_charging and not charging and level <= policy.start_charge_pct:
             charging = True
             session_start_hour = step_start_hour
             session_start_level = level
+            target_stop_level_pct = recommended_stop_level_for_session(
+                current_level_pct=level,
+                remaining_drain_pct_from_now=remaining_drain_pct_from_now,
+                policy=policy,
+            )
 
         if charging:
             charge_rate_pct_per_hour = charge_rate_for_level(level, policy)
             charge_added = charge_rate_pct_per_hour * policy.time_step_hours
-            if level + charge_added >= policy.stop_charge_pct:
-                level = policy.stop_charge_pct
+            if level + charge_added >= target_stop_level_pct:
+                level = target_stop_level_pct
                 charging = False
                 sessions.append(
                     ChargeSession(
                         start_hour=session_start_hour,
-                        stop_hour=step_end_hour,
                         start_level_pct=round(session_start_level, 2),
-                        stop_level_pct=round(level, 2),
+                        recommended_stop_level_pct=round(level, 2),
                     )
                 )
             else:
                 level += charge_added
 
         level = max(0.0, min(100.0, level - drain_pct))
-        levels.append((step_end_hour, round(level, 2)))
+        levels.append((min(24.0, step_start_hour + policy.time_step_hours), round(level, 2)))
 
     if not levels or levels[-1][0] < 24.0:
         levels.append((24.0, round(level, 2)))
@@ -651,8 +697,9 @@ def print_report(forecast: DrainForecast, plan: ChargingPlan, policy: ChargingPo
         f"end={plan.projected_end_battery_pct:.1f}%"
     )
     print(
-        f"Target charging band: {policy.start_charge_pct:.0f}% to "
-        f"{policy.stop_charge_pct:.0f}% around {policy.preferred_level_pct:.0f}%"
+        f"Charging starts near {policy.start_charge_pct:.0f}% and the assistant aims to keep "
+        f"battery around {policy.preferred_level_pct:.0f}% without exceeding "
+        f"{policy.maximum_stop_charge_pct:.0f}% unless you override it."
     )
     print()
 
@@ -664,8 +711,8 @@ def print_report(forecast: DrainForecast, plan: ChargingPlan, policy: ChargingPo
     for index, session in enumerate(plan.sessions, start=1):
         print(
             f"  {index}. Start charging at {format_hour(session.start_hour)} "
-            f"when battery is about {session.start_level_pct:.1f}% and stop at "
-            f"{format_hour(session.stop_hour)} near {session.stop_level_pct:.1f}%."
+            f"when battery is about {session.start_level_pct:.1f}% and unplug near "
+            f"{session.recommended_stop_level_pct:.1f}%."
         )
 
 

@@ -80,9 +80,8 @@ class BatteryPlannerTests(unittest.TestCase):
                 "sessions": [
                     {
                         "start_time": main.format_hour(session.start_hour),
-                        "stop_time": main.format_hour(session.stop_hour),
                         "start_level_pct": round(session.start_level_pct, 1),
-                        "stop_level_pct": round(session.stop_level_pct, 1),
+                        "recommended_stop_level_pct": round(session.recommended_stop_level_pct, 1),
                     }
                     for session in plan.sessions
                 ],
@@ -112,8 +111,8 @@ class BatteryPlannerTests(unittest.TestCase):
             ]
         )
         priors = main.build_usage_priors(train_df)
-        self.assertEqual(priors["by_device_os"]["Train Phone|||Android"]["App Usage Time (min/day)"], 150.0)
-        self.assertNotEqual(priors["by_device_os"]["Train Phone|||Android"]["App Usage Time (min/day)"], 999.0)
+        self.assertEqual(priors["by_os"]["Android"]["App Usage Time (min/day)"], 150.0)
+        self.assertNotIn("by_device_os", priors)
 
     def test_cumulative_usage_share_at_known_hours(self) -> None:
         self.assertAlmostEqual(main.cumulative_usage_share(6.0, main.USAGE_CURVE), 0.06)
@@ -208,6 +207,24 @@ class BatteryPlannerTests(unittest.TestCase):
         self.assertEqual(assumed_forecast.battery_capacity_source, "assumed_default")
         self.assertEqual(provided_forecast.battery_capacity_source, "provided")
 
+    def test_lookup_capacity_source_is_used_for_known_device(self) -> None:
+        lookup_spec = main.DeviceSpec(
+            device_model="Xiaomi Mi 11",
+            operating_system="Android",
+            number_of_apps_installed=60,
+        )
+        snapshot = main.UsageSnapshot(
+            current_hour=12.0,
+            current_battery_pct=70.0,
+            starting_battery_pct=100.0,
+            app_usage_minutes_so_far=140.0,
+            screen_on_hours_so_far=3.2,
+            data_usage_mb_so_far=450.0,
+        )
+        lookup_forecast, _ = self.run_scenario(lookup_spec, snapshot)
+        self.assertEqual(lookup_forecast.battery_capacity_source, "lookup_table")
+        self.assertGreater(lookup_forecast.battery_capacity_mah, 0.0)
+
     def test_heavy_user_requires_charging(self) -> None:
         device_spec = main.DeviceSpec(
             device_model="Xiaomi Mi 11",
@@ -270,8 +287,8 @@ class BatteryPlannerTests(unittest.TestCase):
         self.print_scenario_result("unknown_device_falls_back_to_os_priors", device_spec, snapshot, forecast, plan)
 
         self.assertGreaterEqual(forecast.predicted_remaining_drain_mah, 0.0)
-        self.assertIn("Device Model", forecast.blended_feature_row)
         self.assertIn("Operating System", forecast.blended_feature_row)
+        self.assertIn(main.BATTERY_CAPACITY_COLUMN, forecast.blended_feature_row)
         self.assertGreaterEqual(plan.projected_end_battery_pct, 0.0)
 
     def test_high_battery_late_day_user_does_not_get_unnecessary_charging(self) -> None:
@@ -315,6 +332,7 @@ class BatteryPlannerTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(plan.sessions), 1)
         self.assertEqual(plan.sessions[0].start_hour, snapshot.current_hour)
+        self.assertGreaterEqual(plan.sessions[0].recommended_stop_level_pct, self.policy.minimum_stop_charge_pct)
 
     def test_custom_capacity_changes_percent_conversion(self) -> None:
         assumed_spec = main.DeviceSpec(
@@ -341,7 +359,7 @@ class BatteryPlannerTests(unittest.TestCase):
         provided_forecast, _ = self.run_scenario(provided_spec, snapshot)
 
         self.assertNotEqual(assumed_forecast.observed_drain_so_far_mah, provided_forecast.observed_drain_so_far_mah)
-        self.assertEqual(assumed_forecast.battery_capacity_source, "assumed_default")
+        self.assertEqual(assumed_forecast.battery_capacity_source, "lookup_table")
         self.assertEqual(provided_forecast.battery_capacity_source, "provided")
 
 

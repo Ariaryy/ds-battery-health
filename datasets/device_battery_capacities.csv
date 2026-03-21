@@ -1,0 +1,6 @@
+Device Model,Battery Capacity (mAh),Source Name,Source URL,Matched Text
+Google Pixel 5,4080,Wikipedia,https://en.wikipedia.org/wiki/Google_Pixel_5,battery = 4080{{nbsp}}mAh
+OnePlus 9,4500,Wikipedia,https://en.wikipedia.org/wiki/OnePlus_9,Both phones feature a 4500 mAh lithium polymer battery
+Xiaomi Mi 11,4600,Wikipedia,https://en.wikipedia.org/wiki/Xiaomi_Mi_11,battery = {{Plainlist|*4600mah
+Samsung Galaxy S21,4000,Wikipedia,https://en.wikipedia.org/wiki/Samsung_Galaxy_S21,S21''': {{val|4000|u=mAh}}
+iPhone 12,2815,Wikipedia,https://en.wikipedia.org/wiki/IPhone_12,"iPhone 12 has a 10.78 Wh (2,815 mAh)"

@@ -78,8 +78,8 @@ def pretty_print_user_view(
         for index, session in enumerate(plan.sessions, start=1):
             print(
                 f"  {index}. Start at {app.format_hour(session.start_hour)} "
-                f"around {session.start_level_pct:.1f}% and stop at "
-                f"{app.format_hour(session.stop_hour)} around {session.stop_level_pct:.1f}%."
+                f"around {session.start_level_pct:.1f}% and unplug near "
+                f"{session.recommended_stop_level_pct:.1f}%."
             )
     print()
     print("=" * 72)
@@ -88,11 +88,11 @@ def pretty_print_user_view(
 def main() -> None:
     bundle = app.load_predictor()
 
-    profile = {
-        "Device Model": "Xiaomi Mi 11",
-        "Operating System": "Android",
-        "Number of Apps Installed": 85,
-    }
+    device_spec = app.DeviceSpec(
+        device_model="Xiaomi Mi 11",
+        operating_system="Android",
+        number_of_apps_installed=85,
+    )
     snapshot = app.UsageSnapshot(
         current_hour=13.0,
         current_battery_pct=38.0,
@@ -102,9 +102,9 @@ def main() -> None:
         data_usage_mb_so_far=1350.0,
     )
 
-    forecast = app.forecast_drain(bundle=bundle, profile=profile, snapshot=snapshot)
+    forecast = app.forecast_drain(bundle=bundle, device_spec=device_spec, snapshot=snapshot)
     plan = app.recommend_charging_plan(forecast=forecast, snapshot=snapshot)
-    pretty_print_user_view(profile=profile, snapshot=snapshot, forecast=forecast, plan=plan)
+    pretty_print_user_view(profile=device_spec.__dict__, snapshot=snapshot, forecast=forecast, plan=plan)
 
 
 if __name__ == "__main__":
