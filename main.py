@@ -34,9 +34,25 @@ MIN_USAGE_SHARE = 0.05
 
 TARGET_COLUMN = "Battery Drain (mAh/day)"
 BATTERY_CAPACITY_COLUMN = "Battery Capacity (mAh)"
+APP_USAGE_PER_SCREEN_HOUR_COLUMN = "App Usage per Screen Hour"
+DATA_USAGE_PER_SCREEN_HOUR_COLUMN = "Data Usage per Screen Hour"
+APPS_PER_1000_MAH_COLUMN = "Apps per 1000 mAh"
+SCREEN_TIME_SHARE_OF_DAY_COLUMN = "Screen Time Share of Day"
+IS_HEAVY_USAGE_OUTLIER_COLUMN = "Is Heavy Usage Outlier"
+IS_EFFICIENCY_OUTLIER_COLUMN = "Is Efficiency Outlier"
+
+ENGINEERED_NUMERIC_COLUMNS = [
+    APP_USAGE_PER_SCREEN_HOUR_COLUMN,
+    DATA_USAGE_PER_SCREEN_HOUR_COLUMN,
+    APPS_PER_1000_MAH_COLUMN,
+    SCREEN_TIME_SHARE_OF_DAY_COLUMN,
+    IS_HEAVY_USAGE_OUTLIER_COLUMN,
+    IS_EFFICIENCY_OUTLIER_COLUMN,
+]
+
 STATIC_COLUMNS = ["Operating System", "Number of Apps Installed", BATTERY_CAPACITY_COLUMN]
 DYNAMIC_COLUMNS = ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)"]
-FEATURE_COLUMNS = STATIC_COLUMNS + DYNAMIC_COLUMNS
+FEATURE_COLUMNS = STATIC_COLUMNS + DYNAMIC_COLUMNS + ENGINEERED_NUMERIC_COLUMNS
 NUMERIC_COLUMNS = [
     "App Usage Time (min/day)",
     "Screen On Time (hours/day)",
@@ -47,6 +63,7 @@ NUMERIC_COLUMNS = [
     "Age",
     "User Behavior Class",
 ]
+RAW_SUMMARY_COLUMNS = NUMERIC_COLUMNS.copy()
 CATEGORICAL_COLUMNS = ["Device Model", "Operating System", "Gender"]
 USAGE_CURVE = [
     0.01,
@@ -156,7 +173,13 @@ class CleaningReport:
     cleaned_rows: int
     removed_duplicate_rows: int
     rows_removed_for_missing_required_values: int
+    rows_removed_for_rule_violations: int
     remaining_missing_values: int
+    capped_values_count: int
+    heavy_usage_outlier_rows: int
+    efficiency_outlier_rows: int
+    engineered_feature_count: int
+    battery_capacity_coverage_pct: float
 
 
 def load_dataset(dataset_path: Path = DATASET_PATH) -> pd.DataFrame:
@@ -194,12 +217,42 @@ def clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     for column in NUMERIC_COLUMNS:
         cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
 
+    battery_capacity_coverage_pct = (
+        float(cleaned[BATTERY_CAPACITY_COLUMN].notna().mean() * 100.0)
+        if BATTERY_CAPACITY_COLUMN in cleaned.columns
+        else 0.0
+    )
+
     deduplicated = cleaned.drop_duplicates()
     removed_duplicate_rows = original_rows - len(deduplicated)
 
     required_columns = FEATURE_COLUMNS + [TARGET_COLUMN]
-    cleaned = deduplicated.dropna(subset=required_columns)
+    required_columns_without_engineered = STATIC_COLUMNS + DYNAMIC_COLUMNS + [TARGET_COLUMN]
+    cleaned = deduplicated.dropna(subset=required_columns_without_engineered)
     rows_removed_for_missing_required_values = len(deduplicated) - len(cleaned)
+
+    validation_mask = (
+        cleaned["App Usage Time (min/day)"].between(0, 1440)
+        & cleaned["Screen On Time (hours/day)"].between(0, 24)
+        & cleaned["Data Usage (MB/day)"].ge(0)
+        & cleaned["Number of Apps Installed"].between(1, 500)
+        & cleaned[BATTERY_CAPACITY_COLUMN].between(1500, 7000)
+        & cleaned[TARGET_COLUMN].between(100, 10000)
+    )
+    rows_removed_for_rule_violations = int((~validation_mask).sum())
+    cleaned = cleaned.loc[validation_mask].copy()
+
+    cleaned, capped_values_count = cap_outliers_iqr(
+        cleaned,
+        columns=[
+            "App Usage Time (min/day)",
+            "Screen On Time (hours/day)",
+            "Data Usage (MB/day)",
+            "Number of Apps Installed",
+            TARGET_COLUMN,
+        ],
+    )
+    cleaned = add_engineered_features(cleaned)
 
     remaining_missing_values = int(cleaned.isna().sum().sum())
     report = CleaningReport(
@@ -207,14 +260,64 @@ def clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
         cleaned_rows=len(cleaned),
         removed_duplicate_rows=removed_duplicate_rows,
         rows_removed_for_missing_required_values=rows_removed_for_missing_required_values,
+        rows_removed_for_rule_violations=rows_removed_for_rule_violations,
         remaining_missing_values=remaining_missing_values,
+        capped_values_count=capped_values_count,
+        heavy_usage_outlier_rows=int(cleaned[IS_HEAVY_USAGE_OUTLIER_COLUMN].sum()),
+        efficiency_outlier_rows=int(cleaned[IS_EFFICIENCY_OUTLIER_COLUMN].sum()),
+        engineered_feature_count=len(ENGINEERED_NUMERIC_COLUMNS),
+        battery_capacity_coverage_pct=round(battery_capacity_coverage_pct, 2),
     )
     return cleaned, report
 
 
 def summarize_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    summary = df[NUMERIC_COLUMNS].describe().T
+    summary_columns = RAW_SUMMARY_COLUMNS + ENGINEERED_NUMERIC_COLUMNS
+    summary = df[summary_columns].describe().T
     return summary[["mean", "std", "min", "25%", "50%", "75%", "max"]].round(2)
+
+
+def cap_outliers_iqr(df: pd.DataFrame, columns: list[str]) -> tuple[pd.DataFrame, int]:
+    capped = df.copy()
+    capped_values_count = 0
+    for column in columns:
+        capped[column] = capped[column].astype(float)
+        q1 = capped[column].quantile(0.25)
+        q3 = capped[column].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - (1.5 * iqr)
+        upper = q3 + (1.5 * iqr)
+        below_mask = capped[column] < lower
+        above_mask = capped[column] > upper
+        capped_values_count += int(below_mask.sum() + above_mask.sum())
+        capped.loc[below_mask, column] = lower
+        capped.loc[above_mask, column] = upper
+    return capped, capped_values_count
+
+
+def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+    engineered = df.copy()
+    safe_screen_on = engineered["Screen On Time (hours/day)"].clip(lower=0.1)
+    safe_capacity = engineered[BATTERY_CAPACITY_COLUMN].clip(lower=1000.0)
+
+    engineered[APP_USAGE_PER_SCREEN_HOUR_COLUMN] = engineered["App Usage Time (min/day)"] / safe_screen_on
+    engineered[DATA_USAGE_PER_SCREEN_HOUR_COLUMN] = engineered["Data Usage (MB/day)"] / safe_screen_on
+    engineered[APPS_PER_1000_MAH_COLUMN] = engineered["Number of Apps Installed"] / (safe_capacity / 1000.0)
+    engineered[SCREEN_TIME_SHARE_OF_DAY_COLUMN] = engineered["Screen On Time (hours/day)"] / 24.0
+
+    heavy_usage_score = (
+        engineered["App Usage Time (min/day)"].rank(pct=True)
+        + engineered["Screen On Time (hours/day)"].rank(pct=True)
+        + engineered["Data Usage (MB/day)"].rank(pct=True)
+    ) / 3.0
+    if TARGET_COLUMN in engineered.columns:
+        drain_efficiency_score = (engineered[TARGET_COLUMN] / safe_capacity).rank(pct=True)
+    else:
+        drain_efficiency_score = pd.Series([0.0] * len(engineered), index=engineered.index)
+
+    engineered[IS_HEAVY_USAGE_OUTLIER_COLUMN] = (heavy_usage_score >= 0.95).astype(int)
+    engineered[IS_EFFICIENCY_OUTLIER_COLUMN] = (drain_efficiency_score >= 0.95).astype(int)
+    return engineered
 
 
 def validate_snapshot(snapshot: UsageSnapshot) -> None:
@@ -243,7 +346,14 @@ def train_predictor(
             (
                 "num",
                 StandardScaler(),
-                ["App Usage Time (min/day)", "Screen On Time (hours/day)", "Data Usage (MB/day)", "Number of Apps Installed", BATTERY_CAPACITY_COLUMN],
+                [
+                    "App Usage Time (min/day)",
+                    "Screen On Time (hours/day)",
+                    "Data Usage (MB/day)",
+                    "Number of Apps Installed",
+                    BATTERY_CAPACITY_COLUMN,
+                    *ENGINEERED_NUMERIC_COLUMNS,
+                ],
             ),
         ]
     )
@@ -430,6 +540,7 @@ def blend_dynamic_usage(
 def build_feature_row(device_spec: DeviceSpec, dynamic_usage: dict[str, float]) -> dict[str, Any]:
     feature_row = normalize_device_spec(device_spec)
     feature_row.update(dynamic_usage)
+    feature_row = add_engineered_features(pd.DataFrame([feature_row])).iloc[0].to_dict()
     return feature_row
 
 

@@ -114,6 +114,67 @@ class BatteryPlannerTests(unittest.TestCase):
         self.assertEqual(priors["by_os"]["Android"]["App Usage Time (min/day)"], 150.0)
         self.assertNotIn("by_device_os", priors)
 
+    def test_feature_engineering_adds_expected_columns(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "Device Model": "Phone A",
+                    "Operating System": "Android",
+                    "Number of Apps Installed": 50,
+                    "App Usage Time (min/day)": 180,
+                    "Screen On Time (hours/day)": 3.0,
+                    "Data Usage (MB/day)": 600,
+                    "Battery Drain (mAh/day)": 1200,
+                    "Battery Capacity (mAh)": 4000,
+                }
+            ]
+        )
+        engineered = main.add_engineered_features(df)
+        self.assertIn(main.APP_USAGE_PER_SCREEN_HOUR_COLUMN, engineered.columns)
+        self.assertIn(main.DATA_USAGE_PER_SCREEN_HOUR_COLUMN, engineered.columns)
+        self.assertIn(main.APPS_PER_1000_MAH_COLUMN, engineered.columns)
+        self.assertIn(main.SCREEN_TIME_SHARE_OF_DAY_COLUMN, engineered.columns)
+        self.assertIn(main.IS_HEAVY_USAGE_OUTLIER_COLUMN, engineered.columns)
+        self.assertIn(main.IS_EFFICIENCY_OUTLIER_COLUMN, engineered.columns)
+
+    def test_clean_dataset_reports_preprocessing_work(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "User ID": 1,
+                    "Device Model": "Phone A",
+                    "Operating System": "Android",
+                    "App Usage Time (min/day)": 100,
+                    "Screen On Time (hours/day)": 2.0,
+                    "Battery Drain (mAh/day)": 900,
+                    "Number of Apps Installed": 30,
+                    "Data Usage (MB/day)": 300,
+                    "Age": 30,
+                    "Gender": "Male",
+                    "User Behavior Class": 2,
+                    "Battery Capacity (mAh)": 4000,
+                },
+                {
+                    "User ID": 2,
+                    "Device Model": "Phone B",
+                    "Operating System": "Android",
+                    "App Usage Time (min/day)": 2000,
+                    "Screen On Time (hours/day)": 30.0,
+                    "Battery Drain (mAh/day)": 900,
+                    "Number of Apps Installed": 30,
+                    "Data Usage (MB/day)": 300,
+                    "Age": 31,
+                    "Gender": "Female",
+                    "User Behavior Class": 2,
+                    "Battery Capacity (mAh)": 4000,
+                },
+            ]
+        )
+        cleaned, report = main.clean_dataset(df)
+        self.assertIn(main.APP_USAGE_PER_SCREEN_HOUR_COLUMN, cleaned.columns)
+        self.assertEqual(report.rows_removed_for_rule_violations, 1)
+        self.assertEqual(report.engineered_feature_count, len(main.ENGINEERED_NUMERIC_COLUMNS))
+
     def test_cumulative_usage_share_at_known_hours(self) -> None:
         self.assertAlmostEqual(main.cumulative_usage_share(6.0, main.USAGE_CURVE), 0.06)
         self.assertAlmostEqual(main.cumulative_usage_share(11.0, main.USAGE_CURVE), 0.29)

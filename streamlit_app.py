@@ -72,10 +72,10 @@ def format_label(value: str) -> str:
 
 
 def show_project_overview(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) -> None:
-    st.title("Battery Health Prediction Dashboard")
+    st.title("Battery Drain Forecasting and Charging Assistant")
     st.write(
         "This dashboard presents the complete data science workflow for the battery-drain project: "
-        "dataset inspection, data cleaning, exploratory visualization, model training results, and live prediction."
+        "dataset quality checks, preprocessing, enrichment, exploratory visualization, model training, and live charging guidance."
     )
 
     metric_columns = st.columns(4)
@@ -86,10 +86,10 @@ def show_project_overview(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle
 
 
 def show_cleaning_tab(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame, report: main.CleaningReport) -> None:
-    st.subheader("Data Cleaning")
+    st.subheader("Data Cleaning and Preprocessing")
     st.write(
-        "The preprocessing pipeline standardizes categorical text, converts numeric columns safely, "
-        "removes duplicate observations, and keeps only rows that are usable for modeling."
+        "The preprocessing pipeline does more than basic null handling. It validates realistic ranges, "
+        "caps numeric outliers, enriches the data with battery capacity, and engineers normalized usage features."
     )
 
     metric_columns = st.columns(5)
@@ -98,6 +98,16 @@ def show_cleaning_tab(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame, report: ma
     metric_columns[2].metric("Duplicates Removed", report.removed_duplicate_rows)
     metric_columns[3].metric("Rows Dropped", report.rows_removed_for_missing_required_values)
     metric_columns[4].metric("Missing Values Left", report.remaining_missing_values)
+
+    quality_columns = st.columns(5)
+    quality_columns[0].metric("Rule Violations Removed", report.rows_removed_for_rule_violations)
+    quality_columns[1].metric("Values Capped", report.capped_values_count)
+    quality_columns[2].metric("Heavy Usage Outliers", report.heavy_usage_outlier_rows)
+    quality_columns[3].metric("Efficiency Outliers", report.efficiency_outlier_rows)
+    quality_columns[4].metric("Capacity Coverage", f"{report.battery_capacity_coverage_pct:.1f}%")
+
+    st.caption("Engineered Features Added")
+    st.write(", ".join(main.ENGINEERED_NUMERIC_COLUMNS))
 
     left, right = st.columns(2)
     with left:
@@ -109,6 +119,33 @@ def show_cleaning_tab(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame, report: ma
 
     st.caption("Numeric Summary After Cleaning")
     st.dataframe(main.summarize_dataset(cleaned_df), use_container_width=True)
+
+    feature_left, feature_right = st.columns(2)
+    with feature_left:
+        engineered_preview = cleaned_df[
+            [
+                "Device Model",
+                main.BATTERY_CAPACITY_COLUMN,
+                main.APP_USAGE_PER_SCREEN_HOUR_COLUMN,
+                main.DATA_USAGE_PER_SCREEN_HOUR_COLUMN,
+                main.APPS_PER_1000_MAH_COLUMN,
+                main.SCREEN_TIME_SHARE_OF_DAY_COLUMN,
+            ]
+        ].head(12).round(2)
+        st.caption("Feature Engineering Preview")
+        st.dataframe(engineered_preview, use_container_width=True)
+
+    with feature_right:
+        outlier_counts = pd.DataFrame(
+            {
+                "Flag": ["Heavy Usage Outlier", "Efficiency Outlier"],
+                "Count": [report.heavy_usage_outlier_rows, report.efficiency_outlier_rows],
+            }
+        )
+        fig, ax = plt.subplots(figsize=(6, 3.8))
+        sns.barplot(data=outlier_counts, x="Count", y="Flag", palette="crest", ax=ax)
+        style_axis(ax, "Outlier Flags After Preprocessing", "Rows", "")
+        st.pyplot(fig, clear_figure=True)
 
 
 def show_visualization_tab(cleaned_df: pd.DataFrame) -> None:
@@ -317,8 +354,8 @@ def show_visualization_tab(cleaned_df: pd.DataFrame) -> None:
 def show_training_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) -> None:
     st.subheader("Model Training")
     st.write(
-        f"The modeling stage uses a {bundle.model_name} on encoded categorical features and standardized "
-        "numeric behavior inputs. This section highlights performance and the features that matter most."
+        f"The modeling stage uses a {bundle.model_name} on encoded operating-system information and "
+        "standardized numeric behavior plus hardware features. The raw device name is no longer used as a training feature."
     )
 
     if getattr(main, "XGBOOST_IMPORT_ERROR", None):
@@ -428,6 +465,10 @@ def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) 
         bottom_metrics[1].metric("Recommended Lowest Battery", f"{plan.projected_lowest_battery_pct:.1f}%")
         bottom_metrics[2].metric("End-of-Day Battery", f"{plan.projected_end_battery_pct:.1f}%")
 
+        battery_info_col1, battery_info_col2 = st.columns(2)
+        battery_info_col1.metric("Battery Capacity Used", f"{forecast.battery_capacity_mah:.0f} mAh")
+        battery_info_col2.metric("Capacity Source", forecast.battery_capacity_source.replace("_", " ").title())
+
         battery_projection = pd.DataFrame(
             {
                 "Scenario": ["No charge", "With recommendation", "Current level"],
@@ -473,6 +514,10 @@ def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) 
                 ]
             )
             st.dataframe(schedule_df, use_container_width=True)
+            st.caption(
+                "The assistant recommends what battery percentage to stop at, not an unplug time, "
+                "because charging speed depends heavily on the charger and the phone."
+            )
         else:
             st.success("No charging session is needed if usage stays close to the current forecast.")
 
