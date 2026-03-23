@@ -67,6 +67,12 @@ def load_bundle(retrain: bool = False) -> main.PredictorBundle:
     return main.load_predictor(retrain=retrain)
 
 
+@st.cache_data(show_spinner=False)
+def load_evaluation_results() -> tuple[dict[str, float], pd.DataFrame]:
+    bundle = load_bundle()
+    return main.get_evaluation_results(bundle)
+
+
 def format_label(value: str) -> str:
     return value.replace("_", " ").title()
 
@@ -358,12 +364,6 @@ def show_training_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) ->
         "standardized numeric behavior plus hardware features. The raw device name is no longer used as a training feature."
     )
 
-    if getattr(main, "XGBOOST_IMPORT_ERROR", None):
-        st.warning(
-            "XGBoost is not available in the current environment, so the app retrained using a "
-            "scikit-learn fallback model instead. This keeps the dashboard running without `libomp`."
-        )
-
     train_col, test_col, mae_col = st.columns(3)
     train_col.metric("Training Rows", int(bundle.metrics["train_rows"]))
     test_col.metric("Test Rows", int(bundle.metrics["test_rows"]))
@@ -383,6 +383,60 @@ def show_training_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) ->
 
     st.caption("Modeling Features")
     st.dataframe(cleaned_df[main.FEATURE_COLUMNS + [main.TARGET_COLUMN]].head(12), use_container_width=True)
+
+
+def show_evaluation_tab() -> None:
+    st.subheader("Model Evaluation")
+    st.write(
+        "This project is a regression task, so a confusion matrix is not applicable. "
+        "Instead, evaluation is shown using held-out test-set error metrics and diagnostic plots."
+    )
+
+    metrics, evaluation_df = load_evaluation_results()
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Test Rows", int(metrics["test_rows"]))
+    metric_cols[1].metric("MAE", f"{metrics['mae']:.2f} mAh")
+    metric_cols[2].metric("RMSE", f"{metrics['rmse']:.2f} mAh")
+    metric_cols[3].metric("R2 Score", f"{metrics['r2']:.3f}")
+
+    left, right = st.columns(2)
+    with left:
+        fig, ax = plt.subplots(figsize=(7.6, 4.8))
+        sns.scatterplot(
+            data=evaluation_df,
+            x="actual_drain_mah",
+            y="predicted_drain_mah",
+            alpha=0.65,
+            color="#1f6f66",
+            s=55,
+            ax=ax,
+        )
+        min_drain = min(evaluation_df["actual_drain_mah"].min(), evaluation_df["predicted_drain_mah"].min())
+        max_drain = max(evaluation_df["actual_drain_mah"].max(), evaluation_df["predicted_drain_mah"].max())
+        ax.plot([min_drain, max_drain], [min_drain, max_drain], linestyle="--", color="#d97706", linewidth=2)
+        style_axis(ax, "Actual vs Predicted Drain", "Actual Drain (mAh/day)", "Predicted Drain (mAh/day)")
+        st.pyplot(fig, clear_figure=True)
+
+    with right:
+        fig, ax = plt.subplots(figsize=(7.6, 4.8))
+        sns.histplot(evaluation_df["residual_mah"], bins=24, kde=True, color="#2f7c6e", ax=ax)
+        ax.axvline(0, linestyle="--", color="#d97706", linewidth=2)
+        style_axis(ax, "Residual Distribution", "Residual (Actual - Predicted) mAh", "Count")
+        st.pyplot(fig, clear_figure=True)
+
+    preview_columns = [
+        "Operating System",
+        "Number of Apps Installed",
+        main.BATTERY_CAPACITY_COLUMN,
+        "actual_drain_mah",
+        "predicted_drain_mah",
+        "absolute_error_mah",
+    ]
+    st.caption("Held-Out Test Predictions")
+    st.dataframe(
+        evaluation_df[preview_columns].sort_values("absolute_error_mah", ascending=False).head(15).round(2),
+        use_container_width=True,
+    )
 
 
 def show_prediction_tab(cleaned_df: pd.DataFrame, bundle: main.PredictorBundle) -> None:
@@ -534,6 +588,7 @@ def main_app() -> None:
             "Cleaning",
             "Visualizations",
             "Training",
+            "Evaluation",
             "Prediction",
         ]
     )
@@ -553,6 +608,9 @@ def main_app() -> None:
         show_training_tab(cleaned_df, bundle)
 
     with tabs[4]:
+        show_evaluation_tab()
+
+    with tabs[5]:
         show_prediction_tab(cleaned_df, bundle)
 
 

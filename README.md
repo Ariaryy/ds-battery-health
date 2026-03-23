@@ -8,7 +8,7 @@ This project predicts daily battery drain using user behavior data and includes 
 - model training metrics and feature importance
 - interactive battery drain prediction and charging recommendation
 
-The training pipeline now enriches the source dataset with `Battery Capacity (mAh)` and uses that numeric feature instead of training directly on raw phone names.
+The training pipeline now enriches the source dataset with `Battery Capacity (mAh)` and uses that numeric feature instead of training directly on raw phone names. XGBoost is a required dependency for training and inference.
 
 ## Build the enriched dataset
 
@@ -31,7 +31,8 @@ streamlit run streamlit_app.py
 
 ## Main files
 
-- `main.py`: model training, bundle loading, forecasting, and charging recommendation logic
+- `main.py`: compatibility entry point and demo runner
+- `battery_health/`: package containing configuration, preprocessing, modeling, forecasting, planning, and reporting modules
 - `streamlit_app.py`: dashboard UI for the project workflow
 - `datasets/user_behavior_dataset.csv`: source dataset used for training and analysis
 - `datasets/user_behavior_dataset_enriched.csv`: enriched dataset with `Battery Capacity (mAh)`
